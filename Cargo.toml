@@ -1,0 +1,34 @@
+[package]
+name = "ldk-watchtower-client"
+version = "0.1.0"
+edition = "2021"
+description = "LND watchtower client for LDK — cross-implementation watchtower bridge"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/FreeOnlineUser/ldk-watchtower-client"
+
+[dependencies]
+# Noise protocol for tower handshake (same as Lightning P2P)
+snow = "0.9"
+
+# Encryption for justice blobs
+chacha20poly1305 = "0.10"
+
+# Crypto primitives
+bitcoin = { version = "0.32", features = ["secp-recovery"] }
+secp256k1 = { version = "0.29", features = ["global-context"] }
+
+# Async networking
+tokio = { version = "1", features = ["net", "io-util", "time", "sync", "rt", "macros"] }
+
+# Serialization
+byteorder = "1.5"
+
+# Logging
+log = "0.4"
+
+# Random nonces
+rand = "0.9"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+env_logger = "0.11"
