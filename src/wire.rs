@@ -6,35 +6,95 @@
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{self, Cursor, Read, Write};
 
-/// Wire message type identifiers matching LND's constants.
+/// Wire message type identifiers matching LND's wtwire constants.
+///
+/// Reference: lnd/watchtower/wtwire/message.go
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum MessageType {
+    /// Feature negotiation (first message after handshake).
+    Init = 600,
+    /// Error message.
+    Error = 601,
     /// Client initiates a new session with the tower.
-    CreateSession = 16,
+    CreateSession = 602,
     /// Tower responds to session creation.
-    CreateSessionReply = 17,
+    CreateSessionReply = 603,
     /// Client sends an encrypted state update (justice blob).
-    StateUpdate = 18,
+    StateUpdate = 604,
     /// Tower acknowledges a state update.
-    StateUpdateReply = 19,
+    StateUpdateReply = 605,
     /// Client requests to delete a session.
-    DeleteSession = 20,
+    DeleteSession = 606,
     /// Tower responds to session deletion.
-    DeleteSessionReply = 21,
+    DeleteSessionReply = 607,
 }
 
 impl MessageType {
     pub fn from_u16(v: u16) -> Option<Self> {
         match v {
-            16 => Some(Self::CreateSession),
-            17 => Some(Self::CreateSessionReply),
-            18 => Some(Self::StateUpdate),
-            19 => Some(Self::StateUpdateReply),
-            20 => Some(Self::DeleteSession),
-            21 => Some(Self::DeleteSessionReply),
+            600 => Some(Self::Init),
+            601 => Some(Self::Error),
+            602 => Some(Self::CreateSession),
+            603 => Some(Self::CreateSessionReply),
+            604 => Some(Self::StateUpdate),
+            605 => Some(Self::StateUpdateReply),
+            606 => Some(Self::DeleteSession),
+            607 => Some(Self::DeleteSessionReply),
             _ => None,
         }
+    }
+}
+
+/// Init message: feature negotiation + chain hash.
+///
+/// Wire format:
+///   conn_features: lnwire.RawFeatureVector (2-byte len + bytes)
+///   chain_hash:    [u8; 32] (genesis block hash, internal byte order)
+#[derive(Debug, Clone)]
+pub struct InitMessage {
+    /// Feature bits (altruist-sessions=1, anchor-commit=3)
+    pub features: Vec<u8>,
+    /// Chain hash (Bitcoin mainnet genesis in internal byte order)
+    pub chain_hash: [u8; 32],
+}
+
+impl InitMessage {
+    /// Create an Init for Bitcoin mainnet with altruist + anchor features.
+    pub fn mainnet_altruist_anchor() -> Self {
+        // Feature bits: bit 1 (altruist optional) + bit 3 (anchor optional)
+        // Byte representation: 0b00001010 = 0x0a
+        let features = vec![0x0a];
+
+        // Bitcoin mainnet genesis block hash (internal byte order, same as chainhash.Hash)
+        let chain_hash = [
+            0x6f, 0xe2, 0x8c, 0x0a, 0xb6, 0xf1, 0xb3, 0x72,
+            0xc1, 0xa6, 0xa2, 0x46, 0xae, 0x63, 0xf7, 0x4f,
+            0x93, 0x1e, 0x83, 0x65, 0xe1, 0x5a, 0x08, 0x9c,
+            0x68, 0xd6, 0x19, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+
+        Self { features, chain_hash }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // Feature vector: 2-byte length prefix + bytes
+        buf.write_u16::<BigEndian>(self.features.len() as u16).unwrap();
+        buf.write_all(&self.features).unwrap();
+        // Chain hash: 32 bytes
+        buf.write_all(&self.chain_hash).unwrap();
+        buf
+    }
+
+    pub fn decode(data: &[u8]) -> io::Result<Self> {
+        let mut cursor = Cursor::new(data);
+        let feat_len = cursor.read_u16::<BigEndian>()? as usize;
+        let mut features = vec![0u8; feat_len];
+        cursor.read_exact(&mut features)?;
+        let mut chain_hash = [0u8; 32];
+        cursor.read_exact(&mut chain_hash)?;
+        Ok(Self { features, chain_hash })
     }
 }
 

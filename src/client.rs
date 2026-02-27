@@ -1,7 +1,7 @@
 //! Watchtower client: manages sessions and sends state updates to an LND tower.
 
 use crate::blob::{self, BreachKey, JusticeKitV0};
-use crate::noise::NoiseTransport;
+use crate::brontide::BrontideTransport;
 use crate::wire::{self, BlobType, CreateSession, CreateSessionReply, MessageType, StateUpdate, StateUpdateReply};
 use log::{error, info, warn};
 use std::io;
@@ -35,7 +35,7 @@ pub struct PendingBackup {
 
 /// Active session with a tower.
 struct TowerSession {
-    transport: NoiseTransport,
+    transport: BrontideTransport,
     seq_num: u16,
     last_applied: u16,
     max_updates: u16,
@@ -61,14 +61,17 @@ impl WatchtowerClient {
         info!("Connecting to watchtower at {}", self.config.address);
 
         let stream = TcpStream::connect(&self.config.address).await?;
-        let transport = NoiseTransport::connect(
-            stream,
-            &self.config.client_key,
-            &self.config.tower_pubkey,
-        )
-        .await?;
 
-        info!("Noise handshake complete, creating session");
+        let local_key = secp256k1::SecretKey::from_slice(&self.config.client_key)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput,
+                format!("invalid client key: {}", e)))?;
+        let remote_pub = secp256k1::PublicKey::from_slice(&self.config.tower_pubkey)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput,
+                format!("invalid tower pubkey: {}", e)))?;
+
+        let transport = BrontideTransport::connect(stream, &local_key, &remote_pub).await?;
+
+        info!("Brontide handshake complete, sending Init");
 
         let mut session = TowerSession {
             transport,
@@ -76,6 +79,25 @@ impl WatchtowerClient {
             last_applied: 0,
             max_updates: self.config.max_updates,
         };
+
+        // Send Init message (feature negotiation)
+        let init_msg = wire::InitMessage::mainnet_altruist_anchor();
+        let init_payload = init_msg.encode();
+        let init_wire = wire::encode_message(MessageType::Init, &init_payload);
+        session.transport.send(&init_wire).await?;
+
+        // Read Init reply from tower
+        let init_reply_data = session.transport.recv().await?;
+        let (init_type, init_reply_payload) = wire::decode_message(&init_reply_data)?;
+        if init_type != MessageType::Init {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected Init reply, got {:?}", init_type),
+            ));
+        }
+        let tower_init = wire::InitMessage::decode(&init_reply_payload)?;
+        info!("Tower Init received, features: {:02x?}, chain: {:02x?}",
+            &tower_init.features, &tower_init.chain_hash[..4]);
 
         // Send CreateSession
         let create_msg = CreateSession {
@@ -101,6 +123,15 @@ impl WatchtowerClient {
         }
 
         let reply = CreateSessionReply::decode(&payload)?;
+        info!("CreateSessionReply: code={}, data_len={}", reply.code, reply.data.len());
+
+        if reply.code == 40 {
+            // CodeTemporaryFailure -- tower is temporarily busy, retry later
+            warn!("Tower returned TemporaryFailure (code 40), will retry");
+            self.session = Some(session);
+            return Ok(());
+        }
+
         if !reply.is_ok() {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,

@@ -35,9 +35,9 @@
 //! ```
 
 pub mod blob;
+pub mod brontide;
 pub mod client;
 pub mod ffi;
-pub mod noise;
 pub mod wire;
 
 pub use blob::{BreachKey, JusticeKitV0};
