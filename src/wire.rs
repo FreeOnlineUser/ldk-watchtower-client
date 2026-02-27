@@ -258,7 +258,7 @@ mod tests {
             max_updates: 1024,
             reward_base: 0,
             reward_rate: 0,
-            sweep_fee_rate: 12500, // 50 sat/vB in sat/kw
+            sweep_fee_rate: 2500, // ~10 sat/vB in sat/kw (LND min is 1000)
         };
         let encoded = msg.encode();
         assert_eq!(encoded.len(), 20);

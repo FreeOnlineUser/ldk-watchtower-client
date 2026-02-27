@@ -29,7 +29,7 @@ async fn test_connect_to_live_tower() {
         client_key,
         blob_type: BlobType::ALTRUIST_ANCHOR_COMMIT,
         max_updates: 1024,
-        sweep_fee_rate: 253,
+        sweep_fee_rate: 2500, // ~10 sat/vB, LND min is 1000
     };
 
     let mut client = WatchtowerClient::new(config);
