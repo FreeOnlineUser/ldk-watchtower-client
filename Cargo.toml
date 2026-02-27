@@ -25,6 +25,10 @@ hkdf = "0.12"
 # Async networking
 tokio = { version = "1", features = ["net", "io-util", "time", "sync", "rt", "macros"] }
 
+# Tor connectivity (embedded Arti client for .onion connections)
+arti-client = { version = "0.39", features = ["tokio", "rustls", "onion-service-client", "static-sqlite"], default-features = false }
+tor-rtcompat = { version = "0.39", features = ["tokio", "rustls"] }
+
 # Serialization
 byteorder = "1.5"
 

@@ -3,14 +3,36 @@
 use crate::blob::{self, BreachKey, JusticeKitV0};
 use crate::brontide::BrontideTransport;
 use crate::wire::{self, BlobType, CreateSession, CreateSessionReply, MessageType, StateUpdate, StateUpdateReply};
-use log::{error, info, warn};
+use log::{info, warn};
 use std::io;
 use tokio::net::TcpStream;
+
+// Tor support via Arti
+use arti_client::{TorClient, TorClientConfig, StreamPrefs};
+use tor_rtcompat::PreferredRuntime;
+use std::sync::Arc;
+use tokio::sync::Mutex as TokioMutex;
+
+/// How to reach the watchtower.
+#[derive(Debug, Clone)]
+pub enum TransportMode {
+    /// Direct TCP connection (e.g. via SSH tunnel or LAN).
+    Tcp,
+    /// Connect via embedded Tor to a .onion address.
+    Tor {
+        /// Persistent state directory for Tor consensus cache.
+        /// On Android: context.filesDir + "/tor_state"
+        state_dir: String,
+        /// Cache directory for Tor.
+        /// On Android: context.cacheDir + "/tor_cache"
+        cache_dir: String,
+    },
+}
 
 /// Configuration for connecting to an LND watchtower.
 #[derive(Debug, Clone)]
 pub struct TowerConfig {
-    /// Tower address (host:port).
+    /// Tower address (host:port). For Tor, this is the .onion:port address.
     pub address: String,
     /// Tower's static public key (33 bytes compressed secp256k1).
     pub tower_pubkey: [u8; 33],
@@ -22,6 +44,8 @@ pub struct TowerConfig {
     pub max_updates: u16,
     /// Fee rate for justice transactions (sat/kweight).
     pub sweep_fee_rate: u64,
+    /// Transport mode: direct TCP or via Tor.
+    pub transport: TransportMode,
 }
 
 /// A pending watchtower backup: the data needed to push one state update.
@@ -47,20 +71,115 @@ struct TowerSession {
 pub struct WatchtowerClient {
     config: TowerConfig,
     session: Option<TowerSession>,
+    /// Cached Tor client (bootstrapped lazily on first use).
+    tor_client: Option<Arc<TokioMutex<Option<TorClient<PreferredRuntime>>>>>,
 }
 
 impl WatchtowerClient {
     /// Create a new watchtower client.
     pub fn new(config: TowerConfig) -> Self {
+        let tor_client = match &config.transport {
+            TransportMode::Tor { .. } => Some(Arc::new(TokioMutex::new(None))),
+            TransportMode::Tcp => None,
+        };
         Self {
             config,
             session: None,
+            tor_client,
         }
+    }
+
+    /// Bootstrap or reuse the embedded Tor client.
+    async fn get_tor_client(&self, state_dir: &str, cache_dir: &str) -> io::Result<TorClient<PreferredRuntime>> {
+        let tor_mutex = self.tor_client.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "Tor not configured")
+        })?;
+
+        let mut guard: tokio::sync::MutexGuard<'_, Option<TorClient<PreferredRuntime>>> = tor_mutex.lock().await;
+        if let Some(ref client) = *guard {
+            return Ok(client.clone());
+        }
+
+        info!("Bootstrapping embedded Tor client...");
+
+        // Configure Arti with our storage paths
+        let mut builder = TorClientConfig::builder();
+        // Use string paths for CfgPath compatibility
+        builder.storage().state_dir(arti_client::config::CfgPath::new(state_dir.to_string()));
+        builder.storage().cache_dir(arti_client::config::CfgPath::new(cache_dir.to_string()));
+        // Disable filesystem permission checks (Android sandboxed storage)
+        builder.storage().permissions().dangerously_trust_everyone();
+
+        let config = builder.build()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Tor config: {}", e)))?;
+
+        let client = TorClient::create_bootstrapped(config).await
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Tor bootstrap failed: {}", e)))?;
+
+        info!("Tor client bootstrapped successfully");
+        *guard = Some(client.clone());
+        Ok(client)
     }
 
     /// Helper: open a Brontide connection and exchange Init messages.
     async fn open_connection(&self) -> io::Result<BrontideTransport> {
-        let stream = TcpStream::connect(&self.config.address).await?;
+        let stream: TcpStream = match &self.config.transport {
+            TransportMode::Tcp => {
+                TcpStream::connect(&self.config.address).await?
+            }
+            TransportMode::Tor { state_dir, cache_dir } => {
+                let tor = self.get_tor_client(state_dir, cache_dir).await?;
+
+                // Parse host:port
+                let parts: Vec<&str> = self.config.address.rsplitn(2, ':').collect();
+                if parts.len() != 2 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                        "address must be host:port"));
+                }
+                let port: u16 = parts[0].parse()
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid port"))?;
+                let host = parts[1];
+
+                info!("Connecting to {} via Tor...", self.config.address);
+                let prefs = StreamPrefs::new();
+                let tor_stream = tor.connect_with_prefs((host, port), &prefs).await
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other,
+                        format!("Tor connect failed: {}", e)))?;
+
+                // Arti DataStream implements AsyncRead + AsyncWrite.
+                // Use BrontideTransport::connect_stream() for generic streams.
+                let local_key = secp256k1::SecretKey::from_slice(&self.config.client_key)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput,
+                        format!("invalid client key: {}", e)))?;
+                let remote_pub = secp256k1::PublicKey::from_slice(&self.config.tower_pubkey)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput,
+                        format!("invalid tower pubkey: {}", e)))?;
+
+                let mut transport = BrontideTransport::connect_stream(tor_stream, &local_key, &remote_pub).await?;
+
+                info!("Brontide handshake complete via Tor, exchanging Init");
+
+                // Send Init
+                let init_msg = wire::InitMessage::mainnet_altruist_anchor();
+                let init_payload = init_msg.encode();
+                let init_wire = wire::encode_message(MessageType::Init, &init_payload);
+                transport.send(&init_wire).await?;
+
+                // Read Init reply
+                let init_reply_data = transport.recv().await?;
+                let (init_type, init_reply_payload) = wire::decode_message(&init_reply_data)?;
+                if init_type != MessageType::Init {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("expected Init reply, got {:?}", init_type),
+                    ));
+                }
+                let tower_init = wire::InitMessage::decode(&init_reply_payload)?;
+                info!("Tower Init received via Tor, features: {:02x?}", &tower_init.features);
+
+                return Ok(transport);
+            }
+        };
 
         let local_key = secp256k1::SecretKey::from_slice(&self.config.client_key)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput,

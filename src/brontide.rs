@@ -15,7 +15,8 @@ use hkdf::Hkdf;
 use secp256k1::{PublicKey, Secp256k1, SecretKey};
 use sha2::{Digest, Sha256};
 use std::io;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::pin::Pin;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 const PROTOCOL_NAME: &[u8] = b"Noise_XK_secp256k1_ChaChaPoly_SHA256";
@@ -168,25 +169,92 @@ impl SymmetricState {
 }
 
 /// Established Brontide transport after handshake.
+/// Combined async stream trait for type erasure.
+pub trait AsyncStream: AsyncRead + AsyncWrite + Send + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> AsyncStream for T {}
+
+/// Type-erased async stream for Brontide transport.
+/// Supports TcpStream (direct) and Arti DataStream (Tor).
+pub struct BoxedStream(Pin<Box<dyn AsyncStream>>);
+
+impl BoxedStream {
+    pub fn new<S: AsyncStream + 'static>(s: S) -> Self {
+        Self(Pin::new(Box::new(s)))
+    }
+}
+
+impl tokio::io::AsyncRead for BoxedStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        Pin::new(&mut *self.0).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for BoxedStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        Pin::new(&mut *self.0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        Pin::new(&mut *self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        Pin::new(&mut *self.0).poll_shutdown(cx)
+    }
+}
+
 pub struct BrontideTransport {
-    stream: TcpStream,
+    stream: BoxedStream,
     send_cipher: CipherState,
     recv_cipher: CipherState,
 }
 
 impl BrontideTransport {
-    /// Perform the 3-act Brontide handshake as initiator.
+    /// Perform the 3-act Brontide handshake as initiator over a TCP stream.
     pub async fn connect(
         stream: TcpStream,
         local_key: &SecretKey,
         remote_static: &PublicKey,
     ) -> io::Result<Self> {
-        Self::connect_with_ephemeral(stream, local_key, remote_static, None).await
+        Self::connect_generic(BoxedStream::new(stream), local_key, remote_static, None).await
     }
 
     /// Connect with an optional deterministic ephemeral key (for testing).
     pub async fn connect_with_ephemeral(
-        mut stream: TcpStream,
+        stream: TcpStream,
+        local_key: &SecretKey,
+        remote_static: &PublicKey,
+        test_ephemeral: Option<SecretKey>,
+    ) -> io::Result<Self> {
+        Self::connect_generic(BoxedStream::new(stream), local_key, remote_static, test_ephemeral).await
+    }
+
+    /// Connect over any async stream (TCP, Tor, etc.).
+    pub async fn connect_stream<S: AsyncStream + 'static>(
+        stream: S,
+        local_key: &SecretKey,
+        remote_static: &PublicKey,
+    ) -> io::Result<Self> {
+        Self::connect_generic(BoxedStream::new(stream), local_key, remote_static, None).await
+    }
+
+    /// Internal: handshake over a boxed stream.
+    async fn connect_generic(
+        mut stream: BoxedStream,
         local_key: &SecretKey,
         remote_static: &PublicKey,
         test_ephemeral: Option<SecretKey>,
