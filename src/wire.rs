@@ -3,7 +3,7 @@
 //! Implements the message serialization format used between watchtower clients
 //! and servers as defined in LND's `wtwire` package.
 
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{BigEndian, LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{self, Cursor, Read, Write};
 
 /// Wire message type identifiers matching LND's wtwire constants.
@@ -143,8 +143,10 @@ impl CreateSession {
 /// CreateSessionReply: tower responds to session creation.
 #[derive(Debug, Clone)]
 pub struct CreateSessionReply {
-    /// Response code (0 = accepted).
+    /// Response code (0 = accepted, 60 = already exists).
     pub code: u16,
+    /// Tower's last accepted sequence number for this session.
+    pub last_applied: u16,
     /// Serialized reward script (may be empty for altruist towers).
     pub data: Vec<u8>,
 }
@@ -153,9 +155,10 @@ impl CreateSessionReply {
     pub fn decode(data: &[u8]) -> io::Result<Self> {
         let mut cursor = Cursor::new(data);
         let code = cursor.read_u16::<BigEndian>()?;
+        let last_applied = cursor.read_u16::<BigEndian>()?;
         let mut rest = Vec::new();
         cursor.read_to_end(&mut rest)?;
-        Ok(Self { code, data: rest })
+        Ok(Self { code, last_applied, data: rest })
     }
 
     pub fn is_ok(&self) -> bool {
@@ -193,10 +196,26 @@ impl StateUpdate {
         buf.write_u16::<BigEndian>(self.last_applied).unwrap();
         buf.write_u8(self.is_complete).unwrap();
         buf.write_all(&self.hint).unwrap();
-        // Blob length as u16 then the blob itself
-        buf.write_u16::<BigEndian>(self.encrypted_blob.len() as u16).unwrap();
+        // Blob uses Bitcoin CompactSize (varint) length prefix, matching LND's wire.WriteVarBytes
+        write_compact_size(&mut buf, self.encrypted_blob.len() as u64);
         buf.write_all(&self.encrypted_blob).unwrap();
         buf
+    }
+}
+
+/// Write a Bitcoin CompactSize unsigned integer (same as LND's wire.WriteVarInt).
+fn write_compact_size(buf: &mut Vec<u8>, val: u64) {
+    if val < 253 {
+        buf.push(val as u8);
+    } else if val <= 0xFFFF {
+        buf.push(0xFD);
+        buf.write_u16::<LittleEndian>(val as u16).unwrap();
+    } else if val <= 0xFFFF_FFFF {
+        buf.push(0xFE);
+        buf.write_u32::<LittleEndian>(val as u32).unwrap();
+    } else {
+        buf.push(0xFF);
+        buf.write_u64::<LittleEndian>(val).unwrap();
     }
 }
 

@@ -39,6 +39,8 @@ struct TowerSession {
     seq_num: u16,
     last_applied: u16,
     max_updates: u16,
+    /// Whether the transport is connected for streaming updates.
+    connected: bool,
 }
 
 /// Watchtower client.
@@ -56,10 +58,8 @@ impl WatchtowerClient {
         }
     }
 
-    /// Connect to the tower and establish a session.
-    pub async fn connect(&mut self) -> io::Result<()> {
-        info!("Connecting to watchtower at {}", self.config.address);
-
+    /// Helper: open a Brontide connection and exchange Init messages.
+    async fn open_connection(&self) -> io::Result<BrontideTransport> {
         let stream = TcpStream::connect(&self.config.address).await?;
 
         let local_key = secp256k1::SecretKey::from_slice(&self.config.client_key)
@@ -69,25 +69,18 @@ impl WatchtowerClient {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput,
                 format!("invalid tower pubkey: {}", e)))?;
 
-        let transport = BrontideTransport::connect(stream, &local_key, &remote_pub).await?;
+        let mut transport = BrontideTransport::connect(stream, &local_key, &remote_pub).await?;
 
-        info!("Brontide handshake complete, sending Init");
+        info!("Brontide handshake complete, exchanging Init");
 
-        let mut session = TowerSession {
-            transport,
-            seq_num: 0,
-            last_applied: 0,
-            max_updates: self.config.max_updates,
-        };
-
-        // Send Init message (feature negotiation)
+        // Send Init
         let init_msg = wire::InitMessage::mainnet_altruist_anchor();
         let init_payload = init_msg.encode();
         let init_wire = wire::encode_message(MessageType::Init, &init_payload);
-        session.transport.send(&init_wire).await?;
+        transport.send(&init_wire).await?;
 
-        // Read Init reply from tower
-        let init_reply_data = session.transport.recv().await?;
+        // Read Init reply
+        let init_reply_data = transport.recv().await?;
         let (init_type, init_reply_payload) = wire::decode_message(&init_reply_data)?;
         if init_type != MessageType::Init {
             return Err(io::Error::new(
@@ -99,6 +92,19 @@ impl WatchtowerClient {
         info!("Tower Init received, features: {:02x?}, chain: {:02x?}",
             &tower_init.features, &tower_init.chain_hash[..4]);
 
+        Ok(transport)
+    }
+
+    /// Create a session with the tower.
+    ///
+    /// LND's protocol uses one connection per operation: CreateSession is sent
+    /// on its own connection, then the tower closes it. StateUpdates are sent
+    /// on a separate connection afterward.
+    pub async fn connect(&mut self) -> io::Result<()> {
+        info!("Creating session with watchtower at {}", self.config.address);
+
+        let mut transport = self.open_connection().await?;
+
         // Send CreateSession
         let create_msg = CreateSession {
             blob_type: self.config.blob_type,
@@ -109,10 +115,10 @@ impl WatchtowerClient {
         };
         let payload = create_msg.encode();
         let msg = wire::encode_message(MessageType::CreateSession, &payload);
-        session.transport.send(&msg).await?;
+        transport.send(&msg).await?;
 
         // Read CreateSessionReply
-        let reply_data = session.transport.recv().await?;
+        let reply_data = transport.recv().await?;
         let (msg_type, payload) = wire::decode_message(&reply_data)?;
 
         if msg_type != MessageType::CreateSessionReply {
@@ -123,13 +129,27 @@ impl WatchtowerClient {
         }
 
         let reply = CreateSessionReply::decode(&payload)?;
-        info!("CreateSessionReply: code={}, data_len={}", reply.code, reply.data.len());
+        info!("CreateSessionReply: code={}, last_applied={}", reply.code, reply.last_applied);
+
+        // Code 60 = AlreadyExists (session was created on a previous connection)
+        if reply.code == 60 {
+            info!("Session already exists (last_applied={}), reusing", reply.last_applied);
+            self.session = Some(TowerSession {
+                transport,
+                seq_num: reply.last_applied,
+                last_applied: reply.last_applied,
+                max_updates: self.config.max_updates,
+                connected: false, // CreateSession connection closes after reply
+            });
+            return Ok(());
+        }
 
         if reply.code == 40 {
-            // CodeTemporaryFailure -- tower is temporarily busy, retry later
             warn!("Tower returned TemporaryFailure (code 40), will retry");
-            self.session = Some(session);
-            return Ok(());
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "tower returned TemporaryFailure (code 40)",
+            ));
         }
 
         if !reply.is_ok() {
@@ -139,27 +159,57 @@ impl WatchtowerClient {
             ));
         }
 
-        info!("Watchtower session established (max {} updates)", self.config.max_updates);
-        self.session = Some(session);
+        info!("Session created (max {} updates). Reconnect to send updates.",
+            self.config.max_updates);
+
+        self.session = Some(TowerSession {
+            transport,
+            seq_num: 0,
+            last_applied: 0,
+            max_updates: self.config.max_updates,
+            connected: false, // CreateSession connection closes after reply
+        });
         Ok(())
     }
 
     /// Send a backup (state update) to the tower.
     ///
-    /// The backup contains a justice blob that the tower will store and use
-    /// to construct a justice transaction if it detects the revoked commitment
-    /// on chain.
-    pub async fn send_backup(&mut self, backup: &PendingBackup) -> io::Result<()> {
-        let session = self.session.as_mut().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "no active session")
-        })?;
-
-        if session.seq_num >= session.max_updates {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "session exhausted, need new session",
-            ));
+    /// Opens a NEW connection for each batch of updates (LND closes connection
+    /// after CreateSession, so updates go on a separate connection).
+    /// Ensure we have an active update connection. If not, open one.
+    async fn ensure_update_connection(&mut self) -> io::Result<()> {
+        let needs_connection = match &self.session {
+            Some(s) => !s.connected,
+            None => return Err(io::Error::new(
+                io::ErrorKind::NotConnected, "no active session (call connect first)"
+            )),
+        };
+        if needs_connection {
+            let transport = self.open_connection().await?;
+            let session = self.session.as_mut().unwrap();
+            session.transport = transport;
+            session.connected = true;
         }
+        Ok(())
+    }
+
+    pub async fn send_backup(&mut self, backup: &PendingBackup) -> io::Result<()> {
+        {
+            let session = self.session.as_ref().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotConnected, "no active session (call connect first)")
+            })?;
+            if session.seq_num >= session.max_updates {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "session exhausted, need new session",
+                ));
+            }
+        }
+
+        // Ensure we have an active connection for streaming updates
+        self.ensure_update_connection().await?;
+
+        let session = self.session.as_mut().unwrap();
 
         // Encode the justice kit
         let plaintext = backup.justice_kit.encode();
@@ -199,7 +249,9 @@ impl WatchtowerClient {
 
         let reply = StateUpdateReply::decode(&payload)?;
         if !reply.is_ok() {
-            warn!("Tower rejected state update {}: code {}", session.seq_num, reply.code);
+            session.seq_num -= 1;
+            session.connected = false; // Mark stale on error
+            warn!("Tower rejected state update {}: code {}", session.seq_num + 1, reply.code);
             return Err(io::Error::new(
                 io::ErrorKind::Other,
                 format!("tower rejected update: code {}", reply.code),
@@ -207,6 +259,7 @@ impl WatchtowerClient {
         }
 
         session.last_applied = reply.last_applied;
+
         info!(
             "Backup {} sent successfully (tower applied up to {})",
             session.seq_num, session.last_applied
