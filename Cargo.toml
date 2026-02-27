@@ -6,6 +6,9 @@ description = "LND watchtower client for LDK — cross-implementation watchtower
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/FreeOnlineUser/ldk-watchtower-client"
 
+[lib]
+crate-type = ["lib", "cdylib"]
+
 [dependencies]
 # Noise protocol for tower handshake (same as Lightning P2P)
 snow = "0.9"

@@ -36,6 +36,7 @@
 
 pub mod blob;
 pub mod client;
+pub mod ffi;
 pub mod noise;
 pub mod wire;
 
