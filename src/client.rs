@@ -397,4 +397,14 @@ impl WatchtowerClient {
     pub fn is_connected(&self) -> bool {
         self.session.is_some()
     }
+
+    /// Test connection: perform Brontide handshake + Init exchange only.
+    /// Does not create a session or send any data. Verifies the tower is
+    /// reachable and speaks the correct protocol.
+    pub async fn test_connection(&self) -> io::Result<()> {
+        info!("Testing connection to watchtower at {}", self.config.address);
+        let _transport = self.open_connection().await?;
+        info!("Test connection successful: Brontide handshake + Init exchange OK");
+        Ok(())
+    }
 }

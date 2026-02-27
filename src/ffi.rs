@@ -216,6 +216,138 @@ pub extern "C" fn wtclient_remaining_updates() -> i32 {
     }
 }
 
+/// Test connection to a watchtower (handshake + Init only, no session).
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn wtclient_test_connection(
+    address: *const c_char,
+    tower_pubkey: *const u8,
+    client_key: *const u8,
+) -> i32 {
+    let address = unsafe {
+        if address.is_null() { return -1; }
+        match std::ffi::CStr::from_ptr(address).to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return -1,
+        }
+    };
+
+    let tower_pubkey: [u8; 33] = unsafe {
+        if tower_pubkey.is_null() { return -1; }
+        let mut buf = [0u8; 33];
+        std::ptr::copy_nonoverlapping(tower_pubkey, buf.as_mut_ptr(), 33);
+        buf
+    };
+
+    let client_key: [u8; 32] = unsafe {
+        if client_key.is_null() { return -1; }
+        let mut buf = [0u8; 32];
+        std::ptr::copy_nonoverlapping(client_key, buf.as_mut_ptr(), 32);
+        buf
+    };
+
+    let config = TowerConfig {
+        address,
+        tower_pubkey,
+        client_key,
+        blob_type: BlobType::ALTRUIST_ANCHOR_COMMIT,
+        max_updates: 1,
+        sweep_fee_rate: 2500,
+        transport: TransportMode::Tcp,
+    };
+
+    let rt: Runtime = match RtBuilder::new_current_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(_) => return -1,
+    };
+
+    // Just open a connection (handshake + Init), then drop it
+    let client = WatchtowerClient::new(config);
+    match rt.block_on(client.test_connection()) {
+        Ok(()) => 0,
+        Err(e) => {
+            log::error!("wtclient_test_connection failed: {}", e);
+            -1
+        }
+    }
+}
+
+/// Test connection to a watchtower via Tor (handshake + Init only).
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn wtclient_test_connection_tor(
+    onion_address: *const c_char,
+    tower_pubkey: *const u8,
+    client_key: *const u8,
+    state_dir: *const c_char,
+    cache_dir: *const c_char,
+) -> i32 {
+    let onion_address = unsafe {
+        if onion_address.is_null() { return -1; }
+        match std::ffi::CStr::from_ptr(onion_address).to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return -1,
+        }
+    };
+
+    let state_dir_str = unsafe {
+        if state_dir.is_null() { return -1; }
+        match std::ffi::CStr::from_ptr(state_dir).to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return -1,
+        }
+    };
+
+    let cache_dir_str = unsafe {
+        if cache_dir.is_null() { return -1; }
+        match std::ffi::CStr::from_ptr(cache_dir).to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return -1,
+        }
+    };
+
+    let tower_pubkey: [u8; 33] = unsafe {
+        if tower_pubkey.is_null() { return -1; }
+        let mut buf = [0u8; 33];
+        std::ptr::copy_nonoverlapping(tower_pubkey, buf.as_mut_ptr(), 33);
+        buf
+    };
+
+    let client_key: [u8; 32] = unsafe {
+        if client_key.is_null() { return -1; }
+        let mut buf = [0u8; 32];
+        std::ptr::copy_nonoverlapping(client_key, buf.as_mut_ptr(), 32);
+        buf
+    };
+
+    let config = TowerConfig {
+        address: onion_address,
+        tower_pubkey,
+        client_key,
+        blob_type: BlobType::ALTRUIST_ANCHOR_COMMIT,
+        max_updates: 1,
+        sweep_fee_rate: 2500,
+        transport: TransportMode::Tor {
+            state_dir: state_dir_str,
+            cache_dir: cache_dir_str,
+        },
+    };
+
+    let rt: Runtime = match RtBuilder::new_current_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(_) => return -1,
+    };
+
+    let client = WatchtowerClient::new(config);
+    match rt.block_on(client.test_connection()) {
+        Ok(()) => 0,
+        Err(e) => {
+            log::error!("wtclient_test_connection_tor failed: {}", e);
+            -1
+        }
+    }
+}
+
 /// Connect to a watchtower via embedded Tor (.onion address).
 ///
 /// # Parameters
