@@ -6,8 +6,9 @@ use crate::wire::{self, BlobType, CreateSession, CreateSessionReply, MessageType
 use log::{info, warn};
 use std::io;
 use tokio::net::TcpStream;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-// Tor support via Arti
+// Legacy Tor support via direct Arti (kept for backward compat, will be removed)
 use arti_client::{TorClient, TorClientConfig, StreamPrefs};
 use tor_rtcompat::PreferredRuntime;
 use std::sync::Arc;
@@ -18,7 +19,13 @@ use tokio::sync::Mutex as TokioMutex;
 pub enum TransportMode {
     /// Direct TCP connection (e.g. via SSH tunnel or LAN).
     Tcp,
-    /// Connect via embedded Tor to a .onion address.
+    /// Connect via the shared Arti SOCKS5 proxy (preferred for .onion).
+    /// The proxy must be started first via arti_start_socks().
+    Socks {
+        /// SOCKS5 proxy address, e.g. "127.0.0.1:9050"
+        proxy_addr: String,
+    },
+    /// Connect via embedded Tor to a .onion address (legacy, kept for compat).
     Tor {
         /// Persistent state directory for Tor consensus cache.
         /// On Android: context.filesDir + "/tor_state"
@@ -80,7 +87,7 @@ impl WatchtowerClient {
     pub fn new(config: TowerConfig) -> Self {
         let tor_client = match &config.transport {
             TransportMode::Tor { .. } => Some(Arc::new(TokioMutex::new(None))),
-            TransportMode::Tcp => None,
+            TransportMode::Tcp | TransportMode::Socks { .. } => None,
         };
         Self {
             config,
@@ -126,6 +133,81 @@ impl WatchtowerClient {
         let stream: TcpStream = match &self.config.transport {
             TransportMode::Tcp => {
                 TcpStream::connect(&self.config.address).await?
+            }
+            TransportMode::Socks { proxy_addr } => {
+                info!("Connecting to {} via SOCKS proxy at {}", self.config.address, proxy_addr);
+                let mut stream = TcpStream::connect(proxy_addr).await?;
+
+                // SOCKS5 handshake (no auth)
+                // Client greeting: version 5, 1 method (no auth)
+                stream.write_all(&[0x05, 0x01, 0x00]).await?;
+
+                // Server choice: version 5, method 0 (no auth)
+                let mut resp = [0u8; 2];
+                stream.read_exact(&mut resp).await?;
+                if resp[0] != 0x05 || resp[1] != 0x00 {
+                    return Err(io::Error::new(io::ErrorKind::ConnectionRefused,
+                        format!("SOCKS proxy rejected auth: {:02x} {:02x}", resp[0], resp[1])));
+                }
+
+                // CONNECT request
+                // Parse target address
+                let parts: Vec<&str> = self.config.address.rsplitn(2, ':').collect();
+                if parts.len() != 2 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                        "address must be host:port"));
+                }
+                let port: u16 = parts[0].parse()
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid port"))?;
+                let host = parts[1];
+
+                // Build CONNECT: ver=5, cmd=1 (connect), rsv=0, atype=3 (domain), len, domain, port
+                let host_bytes = host.as_bytes();
+                let mut req = Vec::with_capacity(7 + host_bytes.len());
+                req.push(0x05); // version
+                req.push(0x01); // CONNECT
+                req.push(0x00); // reserved
+                req.push(0x03); // domain name
+                req.push(host_bytes.len() as u8);
+                req.extend_from_slice(host_bytes);
+                req.push((port >> 8) as u8);
+                req.push((port & 0xff) as u8);
+                stream.write_all(&req).await?;
+
+                // Read CONNECT reply (min 10 bytes for IPv4 bind addr)
+                let mut reply = [0u8; 10];
+                stream.read_exact(&mut reply).await?;
+                if reply[0] != 0x05 {
+                    return Err(io::Error::new(io::ErrorKind::ConnectionRefused,
+                        "SOCKS proxy returned wrong version"));
+                }
+                if reply[1] != 0x00 {
+                    return Err(io::Error::new(io::ErrorKind::ConnectionRefused,
+                        format!("SOCKS CONNECT failed: status {}", reply[1])));
+                }
+
+                // If atype is domain (3) or IPv6 (4), drain extra bytes
+                match reply[3] {
+                    0x01 => {} // IPv4 — already read all 10 bytes
+                    0x03 => {
+                        // Domain: 1 byte len + domain + 2 byte port
+                        let domain_len = reply[4] as usize;
+                        let extra = domain_len + 2 - 5; // we already read 5 bytes of addr+port
+                        if extra > 0 {
+                            let mut discard = vec![0u8; extra];
+                            stream.read_exact(&mut discard).await?;
+                        }
+                    }
+                    0x04 => {
+                        // IPv6: 16 bytes + 2 port — we read 6 bytes, need 12 more
+                        let mut discard = [0u8; 12];
+                        stream.read_exact(&mut discard).await?;
+                    }
+                    _ => {}
+                }
+
+                info!("SOCKS CONNECT to {} succeeded", self.config.address);
+                stream
             }
             TransportMode::Tor { state_dir, cache_dir } => {
                 let tor = self.get_tor_client(state_dir, cache_dir).await?;
