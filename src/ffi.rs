@@ -348,6 +348,72 @@ pub extern "C" fn wtclient_test_connection_tor(
     }
 }
 
+// ── Arti SOCKS5 Proxy ────────────────────────────────────────────────
+
+/// Start the Arti SOCKS5 proxy on 127.0.0.1:<port>.
+///
+/// All traffic (bitcoind, HTTP, watchtower) routes through this single proxy.
+/// Bootstraps Tor on first call, reuses cached consensus on subsequent calls.
+///
+/// # Parameters
+/// - `state_dir`: Persistent Tor state directory (null-terminated C string)
+/// - `cache_dir`: Tor cache directory (null-terminated C string)
+/// - `port`: SOCKS5 listen port (e.g. 9050)
+///
+/// # Returns
+/// 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn arti_start_socks(
+    state_dir: *const c_char,
+    cache_dir: *const c_char,
+    port: u16,
+) -> i32 {
+    let state_dir_str = unsafe {
+        if state_dir.is_null() { return -1; }
+        match std::ffi::CStr::from_ptr(state_dir).to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return -1,
+        }
+    };
+    let cache_dir_str = unsafe {
+        if cache_dir.is_null() { return -1; }
+        match std::ffi::CStr::from_ptr(cache_dir).to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return -1,
+        }
+    };
+
+    match crate::socks::start(&state_dir_str, &cache_dir_str, port) {
+        Ok(()) => 0,
+        Err(e) => {
+            log::error!("arti_start_socks failed: {}", e);
+            -1
+        }
+    }
+}
+
+/// Stop the Arti SOCKS5 proxy.
+///
+/// # Returns
+/// 0 on success, -1 if not running.
+#[no_mangle]
+pub extern "C" fn arti_stop_socks() -> i32 {
+    if !crate::socks::is_running() {
+        return -1;
+    }
+    crate::socks::stop();
+    0
+}
+
+/// Check if the Arti SOCKS5 proxy is running.
+///
+/// # Returns
+/// 1 if running, 0 if not.
+#[no_mangle]
+pub extern "C" fn arti_is_running() -> i32 {
+    if crate::socks::is_running() { 1 } else { 0 }
+}
+
 /// Connect to a watchtower via embedded Tor (.onion address).
 ///
 /// # Parameters
